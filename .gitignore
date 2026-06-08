@@ -1,0 +1,25 @@
+# Benchmark output files
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Model weights (downloaded automatically by LightGlue)
+*.pth
+
+# Dataset (too large for repo)
+UAV_VisLoc_dataset/
+dataset/
+
+# Jupyter notebooks (scratch work)
+*.ipynb
+
+# Environment
+.env
+venv/
