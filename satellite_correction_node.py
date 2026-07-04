@@ -97,9 +97,46 @@ except ImportError:
     ROS_AVAILABLE = False
 
 
+import yaml
+
+
+def load_kannala_brandt_calib(yaml_path: str):
+    """
+    Load KANNALA_BRANDT intrinsics from a VINS-Mono style camera yaml.
+    Strips the '%YAML:1.0' header line that OpenCV writes but PyYAML
+    chokes on, and registers a constructor for OpenCV's custom
+    '!!opencv-matrix' tag (used for extrinsicRotation/Translation etc.)
+    so the rest of the file parses even though we don't need those fields.
+    """
+    def _opencv_matrix_constructor(loader, node):
+        mapping = loader.construct_mapping(node, deep=True)
+        return mapping  # we don't use these fields, just need it to parse
+
+    loader_cls = yaml.SafeLoader
+    loader_cls.add_constructor(
+        "tag:yaml.org,2002:opencv-matrix", _opencv_matrix_constructor
+    )
+
+    with open(yaml_path, "r") as f:
+        lines = f.readlines()
+    lines = [l for l in lines if not l.strip().startswith("%YAML")]
+    cfg = yaml.load("".join(lines), Loader=loader_cls)
+
+    proj = cfg["projection_parameters"]
+    K = np.array([
+        [proj["mu"], 0.0,         proj["u0"]],
+        [0.0,        proj["mv"],  proj["v0"]],
+        [0.0,        0.0,         1.0],
+    ], dtype=np.float64)
+    D = np.array([proj["k2"], proj["k3"], proj["k4"],
+                 proj["k5"]], dtype=np.float64)
+    image_size = (int(cfg["image_width"]), int(cfg["image_height"]))
+    return K, D, image_size
+
 # ===========================================================================
 # Matcher core — pure Python, no ROS dependency
 # ===========================================================================
+
 
 @dataclass
 class MatchResult:
@@ -145,6 +182,10 @@ class SatelliteMatcher:
         drone_resize: int = 512,
         ransac_thresh: float = 5.0,
         max_keypoints: int = 2048,
+        cam_K: Optional[np.ndarray] = None,      # NEW
+        cam_D: Optional[np.ndarray] = None,      # NEW
+        cam_image_size: Optional[Tuple[int, int]] = None,  # NEW
+        undistort_balance: float = 0.5,          # NEW
     ):
         self.sat_tif_path = sat_tif_path
         self.search_radius_px = search_radius_px
@@ -152,6 +193,24 @@ class SatelliteMatcher:
         self.min_inlier_ratio = min_inlier_ratio
         self.drone_resize = drone_resize
         self.ransac_thresh = ransac_thresh
+
+        # --- Fisheye undistortion setup (NEW) ---
+        self._undistort_maps = None
+        if cam_K is not None and cam_D is not None and cam_image_size is not None:
+            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                cam_K, cam_D, cam_image_size, np.eye(3),
+                balance=undistort_balance,
+            )
+            map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+                cam_K, cam_D, np.eye(3), new_K, cam_image_size, cv2.CV_16SC2,
+            )
+            self._undistort_maps = (map1, map2)
+            print(f"[SatelliteMatcher] Fisheye undistortion enabled "
+                  f"(image_size={cam_image_size}, balance={undistort_balance})")
+        else:
+            print("[SatelliteMatcher] WARNING: no camera calibration provided — "
+                  "running on raw (distorted) frames.")
+        # ------------------------------------------
 
         # Device selection: MPS on Apple Silicon, CUDA if available, else CPU.
         # In Docker on M1 you'll get CPU — that's fine at 1 Hz trigger rate.
@@ -190,6 +249,12 @@ class SatelliteMatcher:
         else:
             metres_per_px = res
         print(f"[SatelliteMatcher] Resolution: {metres_per_px:.2f} m/px")
+
+    def _undistort(self, img_bgr: np.ndarray) -> np.ndarray:
+        if self._undistort_maps is None:
+            return img_bgr
+        map1, map2 = self._undistort_maps
+        return cv2.remap(img_bgr, map1, map2, interpolation=cv2.INTER_LINEAR)
 
     # ------------------------------------------------------------------
     # Geo utilities
@@ -319,6 +384,7 @@ class SatelliteMatcher:
         sat_gray = crop.img_gray
 
         # Prepare drone image
+        drone_img_bgr = self._undistort(drone_img_bgr)
         drone_gray = cv2.cvtColor(drone_img_bgr, cv2.COLOR_BGR2GRAY) \
             if drone_img_bgr.ndim == 3 else drone_img_bgr.copy()
         drone_gray = cv2.resize(
@@ -683,11 +749,20 @@ def run_standalone(args):
     """
     import csv as csv_module
 
+    cam_K = cam_D = cam_image_size = None
+    if args.cam_config:
+        cam_K, cam_D, cam_image_size = load_kannala_brandt_calib(
+            args.cam_config)
+
     matcher = SatelliteMatcher(
         sat_tif_path=args.sat_tif,
         search_radius_px=args.search_radius,
         min_inliers=args.min_inliers,
         min_inlier_ratio=args.min_inlier_ratio,
+        cam_K=cam_K,
+        cam_D=cam_D,
+        cam_image_size=cam_image_size,
+        undistort_balance=args.undistort_balance,
     )
 
     # Load GT from CSV (used to centre the crop, same as benchmark)
@@ -787,6 +862,9 @@ def main():
     parser.add_argument("--search_radius",    type=int,   default=1200)
     parser.add_argument("--min_inliers",      type=int,   default=15)
     parser.add_argument("--min_inlier_ratio", type=float, default=0.20)
+    parser.add_argument(
+        "--cam_config", help="[standalone] Path to VINS camera yaml (KANNALA_BRANDT)")
+    parser.add_argument("--undistort_balance", type=float, default=0.5)
 
     args = parser.parse_args()
 
