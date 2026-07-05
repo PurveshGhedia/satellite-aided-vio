@@ -486,6 +486,89 @@ class SatelliteMatcher:
     def shutdown(self):
         self._sat_ds.close()
 
+    def visualize_match(
+        self,
+        drone_img_bgr: np.ndarray,
+        save_path: str,
+        vins_lat: Optional[float] = None,
+        vins_lon: Optional[float] = None,
+    ) -> "MatchResult":
+        """
+        Run one match and save a side-by-side image showing only the
+        INLIER matches as connecting lines. Useful for a manual sanity
+        check that matches are real correspondences, not coincidences
+        that happened to fit a transform.
+        """
+        # Re-run the same steps as match(), but keep the intermediate
+        # images and keypoints around so we can draw them.
+        centre_col, centre_row = self.latlon_to_pixel(vins_lat, vins_lon)
+        crop = self.crop_search_region(centre_col, centre_row)
+        sat_gray = crop.img_gray
+
+        drone_img_bgr = self._undistort(drone_img_bgr)
+        drone_gray = cv2.cvtColor(drone_img_bgr, cv2.COLOR_BGR2GRAY) \
+            if drone_img_bgr.ndim == 3 else drone_img_bgr.copy()
+
+        scale = self.drone_resize / max(drone_gray.shape[:2])
+        new_w = int(round(drone_gray.shape[1] * scale))
+        new_h = int(round(drone_gray.shape[0] * scale))
+        drone_gray = cv2.resize(drone_gray, (new_w, new_h))
+
+        with torch.no_grad():
+            feats_sat = self.extractor.extract(self._to_tensor(sat_gray))
+            feats_drone = self.extractor.extract(self._to_tensor(drone_gray))
+            matches_out = self.matcher(
+                {"image0": feats_sat, "image1": feats_drone})
+
+        feats_sat = rbd(feats_sat)
+        feats_drone = rbd(feats_drone)
+        matches_out = rbd(matches_out)
+        match_indices = matches_out["matches"]
+
+        kp_sat = feats_sat["keypoints"][match_indices[:, 0]].cpu().numpy()
+        kp_drone = feats_drone["keypoints"][match_indices[:, 1]].cpu().numpy()
+
+        src_pts = kp_drone.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts = kp_sat.reshape(-1, 1, 2).astype(np.float32)
+
+        if self.use_similarity_transform:
+            M, mask = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC,
+                ransacReprojThreshold=self.ransac_thresh)
+        else:
+            M, mask = cv2.findHomography(
+                src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh)
+
+        inlier_mask = mask.ravel().astype(bool)
+        n_inliers = int(inlier_mask.sum())
+        print(
+            f"[visualize_match] {n_inliers} inliers out of {len(match_indices)} matches")
+
+        # Build cv2.KeyPoint lists and DMatch list for drawMatches,
+        # but only include the INLIER matches so the picture isn't cluttered.
+        kp_sat_cv = [cv2.KeyPoint(float(x), float(y), 1) for x, y in kp_sat]
+        kp_drone_cv = [cv2.KeyPoint(float(x), float(y), 1)
+                       for x, y in kp_drone]
+
+        good_dmatches = [
+            cv2.DMatch(_queryIdx=i, _trainIdx=i, _distance=0)
+            for i in range(len(kp_sat)) if inlier_mask[i]
+        ]
+
+        sat_color = cv2.cvtColor(sat_gray, cv2.COLOR_GRAY2BGR)
+        drone_color = cv2.cvtColor(drone_gray, cv2.COLOR_GRAY2BGR)
+
+        vis = cv2.drawMatches(
+            drone_color, kp_drone_cv,
+            sat_color, kp_sat_cv,
+            good_dmatches, None,
+            matchColor=(0, 255, 0),      # green lines = inliers
+            singlePointColor=(0, 0, 255),
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+        )
+        cv2.imwrite(save_path, vis)
+        print(f"[visualize_match] Saved to {save_path}")
+
 
 # ===========================================================================
 # ROS node wrapper
@@ -799,6 +882,22 @@ def run_standalone(args):
 
     print(f"\n[Standalone] Running on {len(images)} images...\n")
 
+    if args.visualize_frame:
+        img_path = image_dir / args.visualize_frame
+        drone_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        gt = gt_lookup.get(args.visualize_frame)
+        if gt is None:
+            print(f"No GT found for {args.visualize_frame}, cannot visualize.")
+        else:
+            matcher.visualize_match(
+                drone_img_bgr=drone_bgr,
+                save_path=args.visualize_out,
+                vins_lat=gt["lat"],
+                vins_lon=gt["lon"],
+            )
+        matcher.shutdown()
+        return
+
     results = []
     for img_path in images:
         fname = img_path.name
@@ -883,6 +982,10 @@ def main():
     parser.add_argument("--undistort_balance", type=float, default=0.5)
     parser.add_argument("--use_similarity_transform", action="store_true",
                         help="Use a similarity transform (rotate+scale+shift only) instead of a full homography")
+    parser.add_argument(
+        "--visualize_frame", help="Filename of a single frame to visualize matches for (saves a PNG)")
+    parser.add_argument("--visualize_out", default="/tmp/match_visualization.png",
+                        help="Where to save the visualization")
 
     args = parser.parse_args()
 
