@@ -186,6 +186,7 @@ class SatelliteMatcher:
         cam_D: Optional[np.ndarray] = None,      # NEW
         cam_image_size: Optional[Tuple[int, int]] = None,  # NEW
         undistort_balance: float = 0.5,          # NEW
+        use_similarity_transform: bool = False,   # NEW
     ):
         self.sat_tif_path = sat_tif_path
         self.search_radius_px = search_radius_px
@@ -193,6 +194,7 @@ class SatelliteMatcher:
         self.min_inlier_ratio = min_inlier_ratio
         self.drone_resize = drone_resize
         self.ransac_thresh = ransac_thresh
+        self.use_similarity_transform = use_similarity_transform
 
         # --- Fisheye undistortion setup (NEW) ---
         self._undistort_maps = None
@@ -387,8 +389,11 @@ class SatelliteMatcher:
         drone_img_bgr = self._undistort(drone_img_bgr)
         drone_gray = cv2.cvtColor(drone_img_bgr, cv2.COLOR_BGR2GRAY) \
             if drone_img_bgr.ndim == 3 else drone_img_bgr.copy()
-        drone_gray = cv2.resize(
-            drone_gray, (self.drone_resize, self.drone_resize))
+
+        scale = self.drone_resize / max(drone_gray.shape[:2])
+        new_w = int(round(drone_gray.shape[1] * scale))
+        new_h = int(round(drone_gray.shape[0] * scale))
+        drone_gray = cv2.resize(drone_gray, (new_w, new_h))
 
         # SuperPoint + LightGlue
         with torch.no_grad():
@@ -419,14 +424,24 @@ class SatelliteMatcher:
         src_pts = kp_drone.reshape(-1, 1, 2).astype(np.float32)
         dst_pts = kp_sat.reshape(-1, 1, 2).astype(np.float32)
 
-        M, mask = cv2.findHomography(
-            src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh)
+        if self.use_similarity_transform:
+            M, mask = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC,
+                ransacReprojThreshold=self.ransac_thresh)
+            # estimateAffinePartial2D returns a 2x3 matrix, but
+            # perspectiveTransform later needs a 3x3 matrix, so pad it.
+            if M is not None:
+                M = np.vstack([M, [0, 0, 1]])
+        else:
+            M, mask = cv2.findHomography(
+                src_pts, dst_pts, cv2.RANSAC, self.ransac_thresh)
+
         elapsed = (time.time() - t0) * 1000
 
         if M is None:
             return MatchResult(
                 success=False,
-                reason="RANSAC homography failed",
+                reason="RANSAC transform failed",
                 n_matches=n_matches,
                 elapsed_ms=elapsed,
             )
@@ -763,6 +778,7 @@ def run_standalone(args):
         cam_D=cam_D,
         cam_image_size=cam_image_size,
         undistort_balance=args.undistort_balance,
+        use_similarity_transform=args.use_similarity_transform,   # NEW
     )
 
     # Load GT from CSV (used to centre the crop, same as benchmark)
@@ -865,6 +881,8 @@ def main():
     parser.add_argument(
         "--cam_config", help="[standalone] Path to VINS camera yaml (KANNALA_BRANDT)")
     parser.add_argument("--undistort_balance", type=float, default=0.5)
+    parser.add_argument("--use_similarity_transform", action="store_true",
+                        help="Use a similarity transform (rotate+scale+shift only) instead of a full homography")
 
     args = parser.parse_args()
 
