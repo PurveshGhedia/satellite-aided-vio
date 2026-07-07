@@ -133,13 +133,15 @@ def load_kannala_brandt_calib(yaml_path: str):
     return K, D, image_size
 
 
-def central_gradient(img_bgr: np.ndarray, centre_fraction: float = 0.5) -> float:
+def central_gradient(img, centre_fraction: float = 0.5) -> float:
     """
     Mean Sobel gradient magnitude in the central region of the image.
-    Identical to the metric used in extract_bag_frames.py, so a
-    min_gradient threshold calibrated there means the same thing here.
+    Accepts either a grayscale (2D) or BGR (3D) image.
     """
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    if img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
     h, w = gray.shape
     margin_h = int(h * (1 - centre_fraction) / 2)
     margin_w = int(w * (1 - centre_fraction) / 2)
@@ -693,13 +695,14 @@ class SatelliteCorrectionNode:
 
         try:
             drone_bgr = self._bridge.imgmsg_to_cv2(
-                msg, desired_encoding="bgr8")
+                msg, desired_encoding="mono8")
         except Exception as e:
             rospy.logwarn("[SatCorr] imgmsg_to_cv2 failed: %s", e)
             return
 
+        arrival_time = time.time()
         with self._latest_frame_lock:
-            self._latest_frame = (msg.header, drone_bgr)
+            self._latest_frame = (msg.header, drone_bgr, arrival_time)
         self._frame_available.set()
 
     def _matching_worker(self):
@@ -718,13 +721,13 @@ class SatelliteCorrectionNode:
             with self._latest_frame_lock:
                 if self._latest_frame is None:
                     continue
-                header, drone_bgr = self._latest_frame
+                header, drone_bgr, arrival_time = self._latest_frame
                 self._latest_frame = None  # consumed — next one won't be stale
 
             # measure how old this frame actually is when we start processing it
-            frame_age = (rospy.Time.now() - header.stamp).to_sec()
+            queue_delay = time.time() - arrival_time
             rospy.loginfo(
-                "[SatCorr] Processing frame captured %.2fs ago", frame_age)
+                "[SatCorr] Frame sat in queue for %.2fs before processing", queue_delay)
 
             grad = central_gradient(drone_bgr)
             if grad < self.min_gradient:
