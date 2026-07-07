@@ -133,6 +133,24 @@ def load_kannala_brandt_calib(yaml_path: str):
     image_size = (int(cfg["image_width"]), int(cfg["image_height"]))
     return K, D, image_size
 
+
+def central_gradient(img_bgr: np.ndarray, centre_fraction: float = 0.5) -> float:
+    """
+    Mean Sobel gradient magnitude in the central region of the image.
+    Identical to the metric used in extract_bag_frames.py, so a
+    min_gradient threshold calibrated there means the same thing here.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    margin_h = int(h * (1 - centre_fraction) / 2)
+    margin_w = int(w * (1 - centre_fraction) / 2)
+    central = gray[margin_h:h-margin_h, margin_w:w-margin_w]
+    gx = cv2.Sobel(central, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(central, cv2.CV_64F, 0, 1, ksize=3)
+    mag = np.sqrt(gx**2 + gy**2)
+    return float(np.mean(mag))
+
+
 # ===========================================================================
 # Matcher core — pure Python, no ROS dependency
 # ===========================================================================
@@ -587,12 +605,25 @@ class SatelliteCorrectionNode:
 
         # Parameters
         sat_tif = rospy.get_param("~sat_tif")
-        search_radius = rospy.get_param("~search_radius",      600)
+        search_radius = rospy.get_param("~search_radius",      300)
         self.trigger_n = rospy.get_param("~trigger_every",       10)
-        min_inliers = rospy.get_param("~min_inliers",         15)
+        min_inliers = rospy.get_param("~min_inliers",         10)
         min_inlier_ratio = rospy.get_param("~min_inlier_ratio", 0.20)
         drone_resize = rospy.get_param("~drone_resize",        512)
         self.frame_id = rospy.get_param("~frame_id",          "map")
+        min_gradient = rospy.get_param("~min_gradient", 32.0)
+        self.min_gradient = min_gradient
+
+        # NEW: camera calibration + similarity transform
+        cam_config = rospy.get_param("~cam_config", None)
+        undistort_balance = rospy.get_param("~undistort_balance", 0.5)
+        use_similarity_transform = rospy.get_param(
+            "~use_similarity_transform", True)
+
+        cam_K = cam_D = cam_image_size = None
+        if cam_config:
+            cam_K, cam_D, cam_image_size = load_kannala_brandt_calib(
+                cam_config)
 
         # Internal state
         self._bridge = CvBridge()
@@ -607,6 +638,11 @@ class SatelliteCorrectionNode:
             min_inliers=min_inliers,
             min_inlier_ratio=min_inlier_ratio,
             drone_resize=drone_resize,
+            cam_K=cam_K,
+            cam_D=cam_D,
+            cam_image_size=cam_image_size,
+            undistort_balance=undistort_balance,
+            use_similarity_transform=use_similarity_transform,
         )
 
         # Publishers
@@ -659,6 +695,14 @@ class SatelliteCorrectionNode:
                 msg, desired_encoding="bgr8")
         except Exception as e:
             rospy.logwarn("[SatCorr] imgmsg_to_cv2 failed: %s", e)
+            return
+
+        # NEW: skip low-texture frames before running the matcher
+        grad = central_gradient(drone_bgr)
+        if grad < self.min_gradient:
+            rospy.loginfo_throttle(
+                5, "[SatCorr] Skipping low-texture frame (gradient=%.1f < %.1f)",
+                grad, self.min_gradient)
             return
 
         # Get VINS position estimate
@@ -987,7 +1031,12 @@ def main():
     parser.add_argument("--visualize_out", default="/tmp/match_visualization.png",
                         help="Where to save the visualization")
 
-    args = parser.parse_args()
+    if ROS_AVAILABLE:
+        clean_argv = rospy.myargv(argv=sys.argv)[1:]
+    else:
+        clean_argv = sys.argv[1:]
+
+    args = parser.parse_args(clean_argv)
 
     if args.mode == "standalone":
         if not args.sat_tif or not args.image_dir:
