@@ -63,6 +63,9 @@ Usage
         --csv ~/data/UAV_VisLoc_dataset/03/scene_03.csv
 """
 
+import yaml
+from lightglue.utils import rbd
+from lightglue import LightGlue, SuperPoint
 import sys
 import json
 import time
@@ -75,10 +78,9 @@ import rasterio
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+torch.set_num_threads(2)
 
 # LightGlue
-from lightglue import LightGlue, SuperPoint
-from lightglue.utils import rbd
 
 # ---------------------------------------------------------------------------
 # Conditional ROS import — allows the matcher core to run without ROS
@@ -95,9 +97,6 @@ try:
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
-
-
-import yaml
 
 
 def load_kannala_brandt_calib(yaml_path: str):
@@ -613,6 +612,12 @@ class SatelliteCorrectionNode:
         self.frame_id = rospy.get_param("~frame_id",          "map")
         min_gradient = rospy.get_param("~min_gradient", 32.0)
         self.min_gradient = min_gradient
+        self._latest_frame = None
+        self._latest_frame_lock = threading.Lock()
+        self._frame_available = threading.Event()
+        self._worker_thread = threading.Thread(
+            target=self._matching_worker, daemon=True)
+        self._worker_thread.start()
 
         # NEW: camera calibration + similarity transform
         cam_config = rospy.get_param("~cam_config", None)
@@ -677,19 +682,15 @@ class SatelliteCorrectionNode:
 
     def _image_cb(self, msg: "Image"):
         """
-        Main processing callback.
-
-        Runs matching every trigger_n images. Everything heavy (LightGlue)
-        runs inline on the callback thread — ROS image queue depth of 2
-        means we naturally drop frames when matching is slower than
-        the trigger rate. This is the correct behaviour for a correction
-        module: a skipped correction is always safer than a stale one.
+        Lightweight callback — just stores the latest frame and returns
+        immediately. The actual matching work happens in a separate
+        thread (_matching_worker), so this callback never blocks and
+        ROS can keep reading new images in real time.
         """
         self._image_count += 1
         if self._image_count % self.trigger_n != 0:
             return
 
-        # Convert ROS Image to OpenCV BGR
         try:
             drone_bgr = self._bridge.imgmsg_to_cv2(
                 msg, desired_encoding="bgr8")
@@ -697,51 +698,71 @@ class SatelliteCorrectionNode:
             rospy.logwarn("[SatCorr] imgmsg_to_cv2 failed: %s", e)
             return
 
-        # NEW: skip low-texture frames before running the matcher
-        grad = central_gradient(drone_bgr)
-        if grad < self.min_gradient:
-            rospy.loginfo_throttle(
-                5, "[SatCorr] Skipping low-texture frame (gradient=%.1f < %.1f)",
-                grad, self.min_gradient)
-            return
+        with self._latest_frame_lock:
+            self._latest_frame = (msg.header, drone_bgr)
+        self._frame_available.set()
 
-        # Get VINS position estimate
-        with self._odom_lock:
-            odom = self._latest_odom
+    def _matching_worker(self):
+        """
+        Runs in a separate thread. Always processes the MOST RECENT
+        frame available — if a new frame arrives while a match is still
+        running, the old one is simply discarded rather than queued.
+        This prevents the backlog/staleness problem entirely.
+        """
+        while not rospy.is_shutdown():
+            got_frame = self._frame_available.wait(timeout=1.0)
+            if not got_frame:
+                continue
+            self._frame_available.clear()
 
-        vins_lat, vins_lon = self._odom_to_latlon(odom)
+            with self._latest_frame_lock:
+                if self._latest_frame is None:
+                    continue
+                header, drone_bgr = self._latest_frame
+                self._latest_frame = None  # consumed — next one won't be stale
 
-        if vins_lat is None:
-            rospy.logwarn_throttle(
-                10, "[SatCorr] No VIO odometry yet — skipping correction.")
-            return
-
-        # Run matching
-        result = self.matcher.match(
-            drone_img_bgr=drone_bgr,
-            vins_lat=vins_lat,
-            vins_lon=vins_lon,
-        )
-
-        # Publish diagnostics unconditionally
-        self._publish_diagnostics(msg.header, result)
-
-        # Publish pose only on gate pass
-        if result.gate_passed:
-            self._publish_pose(msg.header, result)
+            # measure how old this frame actually is when we start processing it
+            frame_age = (rospy.Time.now() - header.stamp).to_sec()
             rospy.loginfo(
-                "[SatCorr] ACCEPTED | lat=%.6f lon=%.6f | "
-                "inliers=%d ratio=%.2f | %.0fms",
-                result.est_lat, result.est_lon,
-                result.inlier_count, result.inlier_ratio, result.elapsed_ms,
-            )
-        else:
-            reason = result.reason if not result.success else (
-                f"gate failed: inliers={result.inlier_count}, ratio={result.inlier_ratio:.2f}"
-            )
-            rospy.loginfo("[SatCorr] REJECTED | %s | %.0fms",
-                          reason, result.elapsed_ms)
+                "[SatCorr] Processing frame captured %.2fs ago", frame_age)
 
+            grad = central_gradient(drone_bgr)
+            if grad < self.min_gradient:
+                rospy.loginfo_throttle(
+                    5, "[SatCorr] Skipping low-texture frame (gradient=%.1f < %.1f)",
+                    grad, self.min_gradient)
+                continue
+
+            with self._odom_lock:
+                odom = self._latest_odom
+            vins_lat, vins_lon = self._odom_to_latlon(odom)
+            if vins_lat is None:
+                rospy.logwarn_throttle(
+                    10, "[SatCorr] No VIO odometry yet — skipping correction.")
+                continue
+
+            result = self.matcher.match(
+                drone_img_bgr=drone_bgr,
+                vins_lat=vins_lat,
+                vins_lon=vins_lon,
+            )
+
+            self._publish_diagnostics(header, result)
+
+            if result.gate_passed:
+                self._publish_pose(header, result)
+                rospy.loginfo(
+                    "[SatCorr] ACCEPTED | lat=%.6f lon=%.6f | "
+                    "inliers=%d ratio=%.2f | %.0fms",
+                    result.est_lat, result.est_lon,
+                    result.inlier_count, result.inlier_ratio, result.elapsed_ms,
+                )
+            else:
+                reason = result.reason if not result.success else (
+                    f"gate failed: inliers={result.inlier_count}, ratio={result.inlier_ratio:.2f}"
+                )
+                rospy.loginfo("[SatCorr] REJECTED | %s | %.0fms",
+                              reason, result.elapsed_ms)
     # ------------------------------------------------------------------
     # VINS odometry -> lat/lon
     # ------------------------------------------------------------------
