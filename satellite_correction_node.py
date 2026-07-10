@@ -915,6 +915,23 @@ def run_standalone(args):
     """
     import csv as csv_module
 
+    vio_track = []
+    if args.vio_csv:
+        with open(args.vio_csv, newline="") as f:
+            reader = csv_module.DictReader(f)
+            for row in reader:
+                vio_track.append(
+                    (float(row["timestamp"]), float(row["lat"]), float(row["lon"])))
+        vio_track.sort()
+
+    def nearest_vio(ts):
+        if not vio_track:
+            return None, None
+        import bisect
+        idx = bisect.bisect_left(vio_track, (ts,))
+        idx = min(max(idx, 0), len(vio_track) - 1)
+        return vio_track[idx][1], vio_track[idx][2]
+
     cam_K = cam_D = cam_image_size = None
     if args.cam_config:
         cam_K, cam_D, cam_image_size = load_kannala_brandt_calib(
@@ -975,11 +992,16 @@ def run_standalone(args):
             print(f"  [SKIP] Could not load {fname}")
             continue
 
-        # Use GT as crop centre (replicates benchmark behaviour)
-        vins_lat = vins_lon = None
-        if fname in gt_lookup:
-            vins_lat = gt_lookup[fname]["lat"]
-            vins_lon = gt_lookup[fname]["lon"]
+        # Use VIO track if provided (simulates live behavior); else fall back to GT
+        if vio_track:
+            frame_ts = float(fname.replace("frame_", "").replace(".jpg", ""))
+            vins_lat, vins_lon = nearest_vio(frame_ts)
+        else:
+            # Use GT as crop centre (replicates benchmark behaviour)
+            vins_lat = vins_lon = None
+            if fname in gt_lookup:
+                vins_lat = gt_lookup[fname]["lat"]
+                vins_lon = gt_lookup[fname]["lon"]
 
         result = matcher.match(
             drone_img_bgr=drone_bgr,
@@ -1054,6 +1076,8 @@ def main():
         "--visualize_frame", help="Filename of a single frame to visualize matches for (saves a PNG)")
     parser.add_argument("--visualize_out", default="/tmp/match_visualization.png",
                         help="Where to save the visualization")
+    parser.add_argument(
+        "--vio_csv", help="Path to recorded VIO track CSV (timestamp,lat,lon) — centers crop on VIO instead of GT")
 
     if ROS_AVAILABLE:
         clean_argv = rospy.myargv(argv=sys.argv)[1:]
