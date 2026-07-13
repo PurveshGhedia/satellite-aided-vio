@@ -63,6 +63,7 @@ Usage
         --csv ~/data/UAV_VisLoc_dataset/03/scene_03.csv
 """
 
+import math
 import yaml
 from lightglue.utils import rbd
 from lightglue import LightGlue, SuperPoint
@@ -816,15 +817,21 @@ class SatelliteCorrectionNode:
         x_m = odom.pose.pose.position.x
         y_m = odom.pose.pose.position.y
 
-        # Approximate: 1 degree lat ~ 111320m, 1 degree lon ~ 111320 * cos(lat)
+        # NEW: correct for VINS-Mono's arbitrary initial heading, which is
+        # not aligned to true North/East. This offset was measured by
+        # fitting a rotation between recorded VIO points and GT (see
+        # estimate_heading_offset.py) — mean error dropped from 450.5m
+        # to 108.6m after applying it.
+        HEADING_OFFSET_DEG = -20.04
+        theta = math.radians(HEADING_OFFSET_DEG)
+        x_rot = x_m * math.cos(theta) - y_m * math.sin(theta)
+        y_rot = x_m * math.sin(theta) + y_m * math.cos(theta)
+
         origin_lat = float(origin_lat)
         origin_lon = float(origin_lon)
-        import math
-        lat = origin_lat + (y_m / 111320.0)
+        lat = origin_lat + (y_rot / 111320.0)
         lon = origin_lon + \
-            (x_m / (111320.0 * math.cos(math.radians(origin_lat))))
-
-        return lat, lon
+            (x_rot / (111320.0 * math.cos(math.radians(origin_lat))))
 
     # ------------------------------------------------------------------
     # Publishers

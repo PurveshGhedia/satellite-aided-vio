@@ -135,18 +135,24 @@ def main():
     heading_offset_rad = math.atan2(R[1, 0], R[0, 0])
     heading_offset_deg = math.degrees(heading_offset_rad)
 
+    # Full correction is: corrected = R @ raw + translation
+    # where translation = G_mean - R @ V_mean (recovers the origin/offset
+    # mismatch on top of the pure rotation).
+    translation = G_mean - R @ V_mean
+
     # Residual error before and after correction
     before_err = np.linalg.norm(V - G, axis=1)
-    V_corrected = (R @ Vc.T).T + G_mean
+    V_corrected = (R @ V.T).T + translation
     after_err = np.linalg.norm(V_corrected - G, axis=1)
 
     print(f"\nEstimated heading offset: {heading_offset_deg:.2f} degrees")
+    print(f"Estimated translation offset (x, y) in metres: "
+          f"({translation[0]:.2f}, {translation[1]:.2f})")
+    print(f"Mean position error BEFORE correction: {before_err.mean():.1f} m")
     print(
-        f"Mean position error BEFORE rotation correction: {before_err.mean():.1f} m")
+        f"Mean position error AFTER  correction (rotation + translation): {after_err.mean():.1f} m")
     print(
-        f"Mean position error AFTER  rotation correction: {after_err.mean():.1f} m")
-    print(
-        f"Median position error AFTER rotation correction: {np.median(after_err):.1f} m")
+        f"Median position error AFTER correction: {np.median(after_err):.1f} m")
 
 
 if __name__ == "__main__":
