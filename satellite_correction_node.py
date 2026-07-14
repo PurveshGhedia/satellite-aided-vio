@@ -817,21 +817,27 @@ class SatelliteCorrectionNode:
         x_m = odom.pose.pose.position.x
         y_m = odom.pose.pose.position.y
 
-        # NEW: correct for VINS-Mono's arbitrary initial heading, which is
-        # not aligned to true North/East. This offset was measured by
-        # fitting a rotation between recorded VIO points and GT (see
-        # estimate_heading_offset.py) — mean error dropped from 450.5m
-        # to 108.6m after applying it.
-        HEADING_OFFSET_DEG = -20.04
+        # Correct for VINS-Mono's arbitrary initial heading (not aligned to
+        # true North/East) and a small residual origin offset. Both fitted
+        # via estimate_heading_offset.py against recorded VIO vs GT:
+        # mean error dropped from 438.5m to 108.2m after this correction.
+        HEADING_OFFSET_DEG = -25.95
+        TRANSLATION_X_M = 296.67
+        TRANSLATION_Y_M = -116.43
+
         theta = math.radians(HEADING_OFFSET_DEG)
         x_rot = x_m * math.cos(theta) - y_m * math.sin(theta)
         y_rot = x_m * math.sin(theta) + y_m * math.cos(theta)
+        x_corrected = x_rot + TRANSLATION_X_M
+        y_corrected = y_rot + TRANSLATION_Y_M
 
         origin_lat = float(origin_lat)
         origin_lon = float(origin_lon)
-        lat = origin_lat + (y_rot / 111320.0)
+        lat = origin_lat + (y_corrected / 111320.0)
         lon = origin_lon + \
-            (x_rot / (111320.0 * math.cos(math.radians(origin_lat))))
+            (x_corrected / (111320.0 * math.cos(math.radians(origin_lat))))
+
+        return lat, lon
 
     # ------------------------------------------------------------------
     # Publishers
