@@ -2,6 +2,8 @@
 
 Satellite-image-based drift correction for GPS-denied drone navigation. Corrects VIO drift by matching drone camera frames against preloaded satellite imagery, with a confidence gate to reject unreliable corrections before they touch the pose estimate.
 
+This repo covers the core matcher and standalone offline evaluation. The ROS/catkin integration (live correction node, launch files, VINS-Mono config) lives in the companion repo: [satellite-vio-ros](https://github.com/PurveshGhedia/satellite-vio-ros).
+
 ---
 
 ## Overview
@@ -57,9 +59,12 @@ The search patch is always centered on the VINS odometry estimate, never on grou
 - [x] Baseline VIO drift quantified (no correction) via `evo` ATE
 - [x] Standalone satellite matcher tuned and validated on real flight frames
 - [x] ROS package scaffolding + node built and running inside VINS-Mono container
-- [ ] Gradient-based frame filtering to skip featureless terrain (in progress)
+- [x] Fixed VINS-Mono local frame misalignment (ENU frame not aligned to true North/East) via fitted rotation + translation
+- [x] Corrected VIO-centered search radius sweep confirming 300px as optimal
+- [x] Gradient-based frame filtering implemented (calibration mode + live filter gate)
+- [ ] Gradient threshold calibration + re-test standalone matcher on filtered frames (in progress)
 - [ ] Resolve LightGlue/PyTorch threading conflict with VINS-Mono's failure detector
-- [ ] End-to-end closed-loop test: corrected ATE vs. baseline on Bell412
+- [ ] End-to-end closed-loop test: corrected ATE vs. baseline on Bell412 (currently running)
 - [ ] Real camera feed testing with live satellite correction on Jetson
 
 ---
@@ -125,7 +130,7 @@ SE3 and Sim3 error are nearly identical, which confirms the drift is genuine tra
 
 **Satellite tile.** A 6000×6000px GeoTIFF (~0.44m/px) covering a padded bounding box around the flight path, sized to 1.5× the maximum measured baseline drift, was prepared as the correction reference.
 
-**Standalone matcher results.** Running the matcher standalone (outside ROS) against extracted flight frames surfaced a new failure mode not present in the UAV-VisLoc benchmark: much of the Ottawa airfield is low-texture farmland and runway, so LightGlue frequently returns only 0–5 matches and the inlier count sits at the RANSAC minimum — an initial pass on 50 unfiltered color frames yielded 0/50 accepted corrections.
+**Standalone matcher results (GT-centered).** Running the matcher standalone (outside ROS) against extracted flight frames surfaced a new failure mode not present in the UAV-VisLoc benchmark: much of the Ottawa airfield is low-texture farmland and runway, so LightGlue frequently returns only 0–5 matches and the inlier count sits at the RANSAC minimum — an initial pass on 50 unfiltered color frames yielded 0/50 accepted corrections.
 
 After tuning the matcher for this environment:
 
@@ -135,17 +140,21 @@ After tuning the matcher for this environment:
 
 Result on 533 candidate frames: **28 accepted** (mean geo-error 113.4m across accepted frames, 111 frames under 50m error). The strongest cluster, around t≈807–808s over airfield structures, hit 134–241 inliers with 35–40m geo-error, visually confirmed correct.
 
-**Current blocker: featureless terrain.** The dominant failure mode is low-texture ground cover, not fisheye distortion. The fix in progress is gradient-based pre-filtering of candidate frames — a gradient-score calibration pass across the flight to pick a texture threshold, then dense frame extraction filtered to that threshold, before re-running the matcher.
+**VINS-Mono local frame misalignment.** VINS-Mono's local ENU frame turned out not to be aligned to true North/East, which was injecting 450–1000m of systematic error into the satellite-correction coordinate conversion — separate from, and much larger than, the matcher's own error. Fitted a rotation (-25.95°) and translation (296.67m, -116.43m) between the VINS local frame and true North/East-aligned lat/lon, verified against ground truth.
+
+**Standalone matcher results (VIO-centered, post-alignment-fix).** With crop centers computed from VINS-Mono's own odometry (not ground truth) and the frame alignment fix applied, a corrected search radius sweep confirmed **300px as optimal**: 16/533 frames accepted, mean geo-error 171.5m. This is the true measure of expected correction quality in the live pipeline, since it removes the GT-leakage present in the earlier standalone numbers above.
+
+**Current blocker: featureless terrain.** The dominant failure mode is low-texture ground cover, not fisheye distortion. Gradient-based frame filtering is implemented (`extract_bag_frames.py` supports a `--print_gradient` calibration mode and a `--min_gradient` filter; the live correction node applies the same gradient gate before triggering a match). What remains is running the calibration pass across the full flight to pick a proper texture threshold, then a dense filtered extraction and re-test of the standalone matcher on texture-rich frames only.
 
 ---
 
 ## ROS Integration
 
-A `satellite_aided_vio` catkin package is built and running inside the VINS-Mono Docker container. The correction node subscribes to the mono camera topic and computes gradient-based texture scores on incoming frames (handles both 2D and 3D inputs). The scene's local origin is derived from the first VINS odometry timestamp, converted to UTC with the leap-second offset, and matched against the PPK ground-truth file.
+A `satellite_aided_vio` catkin package is built and running inside the VINS-Mono Docker container (full ROS-side source: [satellite-vio-ros](https://github.com/PurveshGhedia/satellite-vio-ros)). The correction node subscribes to the mono camera topic and computes gradient-based texture scores on incoming frames (handles both 2D and 3D inputs). The scene's local origin is derived from the first VINS odometry timestamp, converted to UTC with the leap-second offset, and matched against the PPK ground-truth file.
 
-Resolved along the way: `argparse` conflicting with ROS's own remapping arguments (fixed via `rospy.myargv()`), `use_sim_time` needing to be set before `roslaunch` rather than after, and topic remap syntax for feeding in a renamed camera topic.
+Resolved along the way: `argparse` conflicting with ROS's own remapping arguments (fixed via `rospy.myargv()`), `use_sim_time` needing to be set before `roslaunch` rather than after, topic remap syntax for feeding in a renamed camera topic, and PyTorch thread count limiting (`torch.set_num_threads(2)`) to stop LightGlue's CPU inference from starving VINS-Mono and triggering its failure-detection heuristics.
 
-**Open issue:** PyTorch's multi-threaded CPU inference during LightGlue calls monopolizes CPU cores, which triggers VINS-Mono's own failure-detection heuristics. Needs thread-limiting or throttling before the two can run concurrently.
+**Live end-to-end test.** A closed-loop run (VINS-Mono + live odometry + the corrected ENU-to-latlon conversion + search_radius=300) is currently in progress to measure corrected ATE against the 135.7m baseline. Results pending.
 
 ---
 
@@ -174,6 +183,8 @@ satellite-aided-vio/
 ├── compute_ate.py                 # SE3 + Sim3 ATE computation via evo
 ├── compute_flight_bbox.py         # Computes padded GPS bounding box from .pos file
 ├── extract_bag_frames.py          # Extracts frames from a bag with GT + gradient filtering
+├── extract_vio_track.py           # Extracts recorded VIO odometry to (timestamp, lat, lon) CSV
+├── estimate_heading_offset.py     # Fits rotation/translation between VINS local frame and true North/East
 ├── bell412_config.yaml            # VINS-Mono config for Bell412 sequences
 └── assets/
     └── demo.png                   # Sample LightGlue match visualization
